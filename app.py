@@ -1,11 +1,7 @@
-# ╔══════════════════════════════════════════════════════════════╗
-# ║   Transformer PM — Flask Backend                            ║
-# ║   Render.com deployment                                     ║
-# ╚══════════════════════════════════════════════════════════════╝
-
 import os
-import json
 import sqlite3
+import io
+import base64
 import numpy as np
 import joblib
 from datetime import datetime
@@ -18,17 +14,10 @@ CORS(app)
 # ─────────────────────────────────────────────
 #  CONFIG
 # ─────────────────────────────────────────────
-DB_PATH     = "transformer.db"
-MODEL_PATH  = "model/isolation_forest.pkl"
-SCALER_PATH = "model/scaler.pkl"
-
-ML_FEATURES = ["oil_temp", "winding_temp", "current", "vibration"]
-
-OIL_NORMAL   = 60.0
-OIL_WARNING  = 40.0
-OIL_CRITICAL = 40.0
-
+DB_PATH           = "/tmp/transformer.db"
 ANOMALY_THRESHOLD = 0.15
+OIL_NORMAL        = 60.0
+OIL_CRITICAL      = 40.0
 
 # ─────────────────────────────────────────────
 #  DATABASE
@@ -51,62 +40,73 @@ def init_db():
         db.executescript("""
             CREATE TABLE IF NOT EXISTS readings (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp     TEXT    NOT NULL,
-                oil_temp      REAL    NOT NULL,
-                winding_temp  REAL    NOT NULL,
-                current       REAL    NOT NULL,
-                vibration     REAL    NOT NULL,
-                oil_level     REAL    NOT NULL
+                timestamp     TEXT NOT NULL,
+                oil_temp      REAL NOT NULL,
+                winding_temp  REAL NOT NULL,
+                current       REAL NOT NULL,
+                vibration     REAL NOT NULL,
+                oil_level     REAL NOT NULL
             );
-
             CREATE TABLE IF NOT EXISTS predictions (
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
                 reading_id     INTEGER NOT NULL,
-                timestamp      TEXT    NOT NULL,
-                anomaly_score  REAL    NOT NULL,
+                timestamp      TEXT NOT NULL,
+                anomaly_score  REAL NOT NULL,
                 is_anomaly     INTEGER NOT NULL,
                 oil_severity   INTEGER NOT NULL,
                 ml_severity    INTEGER NOT NULL,
                 alert_severity INTEGER NOT NULL,
-                fault_type     TEXT    NOT NULL,
-                health_index   REAL    NOT NULL,
-                model_version  TEXT    NOT NULL
+                fault_type     TEXT NOT NULL,
+                health_index   REAL NOT NULL,
+                model_version  TEXT NOT NULL
             );
-
-            CREATE TABLE IF NOT EXISTS model_meta (
+            CREATE TABLE IF NOT EXISTS model_store (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                trained_at    TEXT    NOT NULL,
+                trained_at    TEXT NOT NULL,
                 n_samples     INTEGER NOT NULL,
-                model_version TEXT    NOT NULL,
-                contamination REAL    NOT NULL
+                model_version TEXT NOT NULL,
+                contamination REAL NOT NULL,
+                features      TEXT NOT NULL,
+                model_blob    BLOB NOT NULL,
+                scaler_blob   BLOB NOT NULL
             );
         """)
         db.commit()
     print("[DB] Initialised")
 
 # ─────────────────────────────────────────────
-#  LOAD MODEL
+#  MODEL — stored in DB, loaded into memory
 # ─────────────────────────────────────────────
-model  = None
-scaler = None
+model    = None
+scaler   = None
+features = ["winding_temp", "current", "vibration"]
 
-def load_model():
-    global model, scaler
-    if os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH):
-        model  = joblib.load(MODEL_PATH)
-        scaler = joblib.load(SCALER_PATH)
-        print("[MODEL] Loaded from disk")
-    else:
-        print("[MODEL] Not found — waiting for training")
+def load_model_from_db():
+    global model, scaler, features
+    try:
+        with app.app_context():
+            db  = get_db()
+            row = db.execute(
+                "SELECT * FROM model_store ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if row:
+                model   = joblib.load(io.BytesIO(row["model_blob"]))
+                scaler  = joblib.load(io.BytesIO(row["scaler_blob"]))
+                features= row["features"].split(",")
+                print(f"[MODEL] Loaded from DB — version={row['model_version']} features={features}")
+            else:
+                print("[MODEL] No model in DB yet")
+    except Exception as e:
+        print(f"[MODEL] Load error: {e}")
 
 # ─────────────────────────────────────────────
-#  PREDICTION LOGIC
+#  PREDICTION
 # ─────────────────────────────────────────────
-def predict_anomaly(oil_temp, winding_temp, current, vibration):
+def predict_anomaly(row_data):
     if model is None or scaler is None:
         return 0.0, False, 0, "NORMAL"
 
-    X        = np.array([[oil_temp, winding_temp, current, vibration]])
+    X        = np.array([[row_data[f] for f in features]])
     X_scaled = scaler.transform(X)
 
     raw_score     = model.score_samples(X_scaled)[0]
@@ -122,16 +122,15 @@ def predict_anomaly(oil_temp, winding_temp, current, vibration):
 
     fault_type = "NORMAL"
     if is_anomaly:
-        X_mean    = scaler.mean_
-        X_diff    = abs(X_scaled[0] - X_mean / (scaler.scale_ + 1e-9))
-        worst_idx = int(np.argmax(X_diff))
+        diffs     = np.abs(X_scaled[0])
+        worst_idx = int(np.argmax(diffs))
         fault_map = {
-            0: "OIL_OVERTEMP",
-            1: "WINDING_OVERTEMP",
-            2: "OVERCURRENT",
-            3: "VIBRATION"
+            "oil_temp":     "OIL_OVERTEMP",
+            "winding_temp": "WINDING_OVERTEMP",
+            "current":      "OVERCURRENT",
+            "vibration":    "VIBRATION"
         }
-        fault_type = fault_map.get(worst_idx, "UNKNOWN")
+        fault_type = fault_map.get(features[worst_idx], "UNKNOWN")
 
     return anomaly_score, is_anomaly, ml_severity, fault_type
 
@@ -154,9 +153,9 @@ def log_reading():
         return jsonify({"error": "No JSON body"}), 400
 
     required = ["oil_temp", "winding_temp", "current", "vibration", "oil_level"]
-    for field in required:
-        if field not in data:
-            return jsonify({"error": "Missing field: " + field}), 400
+    for f in required:
+        if f not in data:
+            return jsonify({"error": "Missing: " + f}), 400
 
     oil_temp     = float(data["oil_temp"])
     winding_temp = float(data["winding_temp"])
@@ -167,33 +166,34 @@ def log_reading():
 
     db  = get_db()
     cur = db.execute(
-        "INSERT INTO readings (timestamp, oil_temp, winding_temp, current, vibration, oil_level) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO readings (timestamp,oil_temp,winding_temp,current,vibration,oil_level) VALUES (?,?,?,?,?,?)",
         (ts, oil_temp, winding_temp, current, vibration, oil_level)
     )
     db.commit()
     reading_id = cur.lastrowid
 
-    anomaly_score, is_anomaly, ml_sev, fault_type = predict_anomaly(
-        oil_temp, winding_temp, current, vibration)
-
+    row_data = {
+        "oil_temp": oil_temp, "winding_temp": winding_temp,
+        "current":  current,  "vibration":    vibration
+    }
+    anomaly_score, is_anomaly, ml_sev, fault_type = predict_anomaly(row_data)
     oil_sev, oil_fault = check_oil_level(oil_level)
 
     final_severity = max(ml_sev, oil_sev)
     if final_severity > 0 and oil_sev >= ml_sev:
         fault_type = oil_fault
 
-    health_index = round((1.0 - anomaly_score) * 100.0, 2)
-
-    meta = db.execute(
-        "SELECT model_version FROM model_meta ORDER BY id DESC LIMIT 1"
+    health_index  = round((1.0 - anomaly_score) * 100.0, 2)
+    meta          = db.execute(
+        "SELECT model_version FROM model_store ORDER BY id DESC LIMIT 1"
     ).fetchone()
     model_version = meta["model_version"] if meta else "none"
 
     db.execute(
         """INSERT INTO predictions
-           (reading_id, timestamp, anomaly_score, is_anomaly, oil_severity,
-            ml_severity, alert_severity, fault_type, health_index, model_version)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           (reading_id,timestamp,anomaly_score,is_anomaly,oil_severity,
+            ml_severity,alert_severity,fault_type,health_index,model_version)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
         (reading_id, ts, anomaly_score, int(is_anomaly), oil_sev,
          ml_sev, final_severity, fault_type, health_index, model_version)
     )
@@ -224,7 +224,7 @@ def api_status():
     db   = get_db()
     n    = db.execute("SELECT COUNT(*) as c FROM readings").fetchone()["c"]
     meta = db.execute(
-        "SELECT * FROM model_meta ORDER BY id DESC LIMIT 1"
+        "SELECT id,trained_at,n_samples,model_version,contamination,features FROM model_store ORDER BY id DESC LIMIT 1"
     ).fetchone()
     return jsonify({
         "total_readings": n,
@@ -240,40 +240,43 @@ def api_health():
 
 @app.route("/api/train", methods=["POST"])
 def api_train():
-    import base64
-    global model, scaler
-
+    global model, scaler, features
     data = request.get_json(silent=True)
     if not data:
-        return jsonify({"error": "No JSON body"}), 400
+        return jsonify({"error": "No JSON"}), 400
 
     try:
-        model_b64     = data["model_b64"]
-        scaler_b64    = data["scaler_b64"]
-        n_samples     = int(data["n_samples"])
-        contamination = float(data["contamination"])
-        model_version = data.get("model_version", "v1.0")
+        model_bytes  = base64.b64decode(data["model_b64"])
+        scaler_bytes = base64.b64decode(data["scaler_b64"])
+        n_samples    = int(data["n_samples"])
+        contamination= float(data["contamination"])
+        model_version= data.get("model_version", "v1.0")
+        feat_list    = data.get("features", "winding_temp,current,vibration")
 
-        os.makedirs("model", exist_ok=True)
+        # Load into memory
+        model   = joblib.load(io.BytesIO(model_bytes))
+        scaler  = joblib.load(io.BytesIO(scaler_bytes))
+        features= feat_list.split(",") if isinstance(feat_list, str) else feat_list
 
-        with open(MODEL_PATH,  "wb") as f:
-            f.write(base64.b64decode(model_b64))
-        with open(SCALER_PATH, "wb") as f:
-            f.write(base64.b64decode(scaler_b64))
-
-        load_model()
-
+        # Store in DB as blob — survives restarts
         db = get_db()
         db.execute(
-            "INSERT INTO model_meta (trained_at, n_samples, model_version, contamination) VALUES (?, ?, ?, ?)",
+            """INSERT INTO model_store
+               (trained_at,n_samples,model_version,contamination,features,model_blob,scaler_blob)
+               VALUES (?,?,?,?,?,?,?)""",
             (datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-             n_samples, model_version, contamination)
+             n_samples, model_version, contamination,
+             ",".join(features),
+             sqlite3.Binary(model_bytes),
+             sqlite3.Binary(scaler_bytes))
         )
         db.commit()
+        print(f"[MODEL] Saved to DB — {model_version} features={features}")
 
         return jsonify({
             "status":        "model loaded",
             "model_version": model_version,
+            "features":      features,
             "n_samples":     n_samples
         }), 200
 
@@ -309,101 +312,73 @@ def dashboard():
     last = dict(last) if last else {}
     rows = [dict(r) for r in recent]
 
-    sev            = last.get("alert_severity", 0)
-    severity_color = {0: "#00ff88", 1: "#ffaa00", 2: "#ff3333"}
-    color          = severity_color.get(sev, "#00ff88")
+    sev   = last.get("alert_severity", 0) or 0
+    color = {0: "#00ff88", 1: "#ffaa00", 2: "#ff3333"}.get(sev, "#00ff88")
+    label = {0: "NORMAL", 1: "WARNING", 2: "CRITICAL"}.get(sev, "NORMAL")
+    fault = last.get("fault_type", "—") or "—"
+    health= round(last.get("health_index") or 100, 1)
+    ascore= round(last.get("anomaly_score") or 0, 4)
+    mstat = "READY" if model else "WAITING FOR TRAINING"
 
-    if sev == 2:
-        status_label = "CRITICAL"
-        status_icon  = "RED"
-    elif sev == 1:
-        status_label = "WARNING"
-        status_icon  = "YELLOW"
-    else:
-        status_label = "NORMAL"
-        status_icon  = "GREEN"
-
-    fault       = last.get("fault_type", "—")
-    health      = last.get("health_index", 100)
-    ascore      = last.get("anomaly_score", 0) or 0
-    model_status = "READY" if model else "WAITING FOR TRAINING"
-
-    def row_html(r):
-        sev_r  = r.get("alert_severity", 0) or 0
-        sc     = round(r.get("anomaly_score") or 0, 4)
-        ts     = str(r.get("timestamp", ""))[-8:]
-        ot     = r.get("oil_temp", "")
-        wt     = r.get("winding_temp", "")
-        cu     = r.get("current", "")
-        vb     = r.get("vibration", "")
-        ol     = r.get("oil_level", "")
-        ft     = r.get("fault_type", "—")
-        hi     = round(r.get("health_index") or 100, 1)
+    def make_row(r):
+        s = r.get("alert_severity") or 0
         return (
             "<tr>"
-            "<td>" + ts + "</td>"
-            "<td>" + str(ot) + "</td>"
-            "<td>" + str(wt) + "</td>"
-            "<td>" + str(cu) + "</td>"
-            "<td>" + str(vb) + "</td>"
-            "<td>" + str(ol) + "</td>"
-            "<td>" + str(sc) + "</td>"
-            "<td>" + str(hi) + "%</td>"
-            "<td>" + str(ft) + "</td>"
-            "<td class=\"s" + str(sev_r) + "\">" + str(sev_r) + "</td>"
+            "<td>" + str(r.get("timestamp","")[-8:]) + "</td>"
+            "<td>" + str(r.get("oil_temp","")) + "</td>"
+            "<td>" + str(r.get("winding_temp","")) + "</td>"
+            "<td>" + str(r.get("current","")) + "</td>"
+            "<td>" + str(r.get("vibration","")) + "</td>"
+            "<td>" + str(r.get("oil_level","")) + "</td>"
+            "<td>" + str(round(r.get("anomaly_score") or 0, 4)) + "</td>"
+            "<td>" + str(round(r.get("health_index") or 100, 1)) + "%</td>"
+            "<td>" + str(r.get("fault_type","—")) + "</td>"
+            "<td class='s" + str(s) + "'>" + str(s) + "</td>"
             "</tr>"
         )
 
-    rows_html = "".join(row_html(r) for r in rows)
-
     html = (
-        "<!DOCTYPE html>"
-        "<html><head>"
+        "<!DOCTYPE html><html><head>"
         "<meta charset='UTF-8'>"
         "<meta http-equiv='refresh' content='5'>"
         "<title>Transformer PM</title>"
         "<style>"
-        "* { box-sizing: border-box; margin: 0; padding: 0; }"
-        "body { background: #0d1117; color: #e6edf3; font-family: monospace; padding: 20px; }"
-        "h1 { color: #58a6ff; margin-bottom: 20px; font-size: 1.4em; }"
-        ".grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin-bottom: 20px; }"
-        ".card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }"
-        ".card h3 { color: #8b949e; font-size: 0.8em; margin-bottom: 8px; }"
-        ".card .val { font-size: 1.8em; font-weight: bold; }"
-        ".status { background: #161b22; border: 2px solid " + color + "; border-radius: 8px; padding: 16px; margin-bottom: 20px; text-align: center; }"
-        ".status h2 { color: " + color + "; font-size: 1.6em; }"
-        "table { width: 100%; border-collapse: collapse; background: #161b22; border-radius: 8px; overflow: hidden; }"
-        "th { background: #21262d; color: #8b949e; padding: 10px; font-size: 0.75em; text-align: left; }"
-        "td { padding: 8px 10px; font-size: 0.78em; border-bottom: 1px solid #21262d; }"
-        "tr:hover { background: #1c2128; }"
-        ".s0 { color: #00ff88; } .s1 { color: #ffaa00; } .s2 { color: #ff3333; }"
+        "*{box-sizing:border-box;margin:0;padding:0}"
+        "body{background:#0d1117;color:#e6edf3;font-family:monospace;padding:20px}"
+        "h1{color:#58a6ff;margin-bottom:20px;font-size:1.4em}"
+        ".grid{display:grid;grid-template-columns:repeat(3,1fr);gap:15px;margin-bottom:20px}"
+        ".card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px}"
+        ".card h3{color:#8b949e;font-size:0.8em;margin-bottom:8px}"
+        ".card .val{font-size:1.8em;font-weight:bold}"
+        ".status{background:#161b22;border:2px solid " + color + ";border-radius:8px;padding:16px;margin-bottom:20px;text-align:center}"
+        ".status h2{color:" + color + ";font-size:1.6em}"
+        "table{width:100%;border-collapse:collapse;background:#161b22;border-radius:8px;overflow:hidden}"
+        "th{background:#21262d;color:#8b949e;padding:10px;font-size:0.75em;text-align:left}"
+        "td{padding:8px 10px;font-size:0.78em;border-bottom:1px solid #21262d}"
+        "tr:hover{background:#1c2128}"
+        ".s0{color:#00ff88}.s1{color:#ffaa00}.s2{color:#ff3333}"
         "</style></head><body>"
         "<h1>Transformer PM — Live Dashboard</h1>"
-        "<div class='status'>"
-        "<h2>[" + status_icon + "] " + status_label + " — " + fault + "</h2>"
-        "<p>Health: " + str(round(health, 1)) + "% &nbsp;|&nbsp; "
-        "Score: " + str(round(ascore, 4)) + " &nbsp;|&nbsp; "
-        "Readings: " + str(n_total) + " &nbsp;|&nbsp; "
-        "Anomalies: " + str(n_anomaly) + " &nbsp;|&nbsp; "
-        "Model: " + model_status + "</p>"
-        "</div>"
+        "<div class='status'><h2>" + label + " — " + fault + "</h2>"
+        "<p>Health: " + str(health) + "% | Score: " + str(ascore) +
+        " | Readings: " + str(n_total) +
+        " | Anomalies: " + str(n_anomaly) +
+        " | Model: " + mstat + "</p></div>"
         "<div class='grid'>"
-        "<div class='card'><h3>OIL TEMP</h3><div class='val'>" + str(last.get("oil_temp", "—")) + " C</div></div>"
-        "<div class='card'><h3>WINDING TEMP</h3><div class='val'>" + str(last.get("winding_temp", "—")) + " C</div></div>"
-        "<div class='card'><h3>CURRENT</h3><div class='val'>" + str(last.get("current", "—")) + " A</div></div>"
-        "<div class='card'><h3>VIBRATION</h3><div class='val'>" + str(last.get("vibration", "—")) + " m/s2</div></div>"
-        "<div class='card'><h3>OIL LEVEL</h3><div class='val'>" + str(last.get("oil_level", "—")) + " %</div></div>"
-        "<div class='card'><h3>MODEL STATUS</h3><div class='val' style='font-size:1em'>" + model_status + "</div></div>"
+        "<div class='card'><h3>OIL TEMP</h3><div class='val'>" + str(last.get("oil_temp","—")) + " C</div></div>"
+        "<div class='card'><h3>WINDING TEMP</h3><div class='val'>" + str(last.get("winding_temp","—")) + " C</div></div>"
+        "<div class='card'><h3>CURRENT</h3><div class='val'>" + str(last.get("current","—")) + " A</div></div>"
+        "<div class='card'><h3>VIBRATION</h3><div class='val'>" + str(last.get("vibration","—")) + " m/s2</div></div>"
+        "<div class='card'><h3>OIL LEVEL</h3><div class='val'>" + str(last.get("oil_level","—")) + " %</div></div>"
+        "<div class='card'><h3>MODEL</h3><div class='val' style='font-size:1em'>" + mstat + "</div></div>"
         "</div>"
         "<table><tr>"
         "<th>TIME</th><th>OIL C</th><th>WIND C</th>"
         "<th>I(A)</th><th>VIB</th><th>OIL%</th>"
         "<th>SCORE</th><th>HEALTH</th><th>FAULT</th><th>SEV</th>"
-        "</tr>"
-        + rows_html +
+        "</tr>" + "".join(make_row(r) for r in rows) +
         "</table>"
-        "<p style='color:#8b949e; margin-top:10px; font-size:0.75em'>"
-        "Auto-refresh 5s | UTC</p>"
+        "<p style='color:#8b949e;margin-top:10px;font-size:0.75em'>Auto-refresh 5s | UTC</p>"
         "</body></html>"
     )
     return html
@@ -413,7 +388,7 @@ def dashboard():
 #  MAIN
 # ─────────────────────────────────────────────
 init_db()
-load_model()
+load_model_from_db()
 
 if __name__ == "__main__":
     app.run(debug=False, host="0.0.0.0", port=5000)
