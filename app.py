@@ -382,6 +382,13 @@ def dashboard():
         "</body></html>"
     )
     return html
+@app.route("/api/reload", methods=["POST"])
+def api_reload():
+    load_model_from_db()
+    return jsonify({
+        "model_ready": model is not None,
+        "features":    features
+    }), 200
 
 
 # ─────────────────────────────────────────────
