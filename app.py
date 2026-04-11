@@ -15,7 +15,8 @@ CORS(app)
 #  CONFIG
 # ─────────────────────────────────────────────
 DB_PATH           = "/tmp/transformer.db"
-ANOMALY_THRESHOLD = 0.15
+ANOMALY_THRESHOLD = 0.55
+ANOMALY_CRITICAL  = 0.65
 OIL_NORMAL        = 60.0
 OIL_CRITICAL      = 40.0
 
