@@ -114,7 +114,7 @@ def predict_anomaly(row_data):
     anomaly_score = float(np.clip(-raw_score, 0, 1))
     is_anomaly    = anomaly_score > ANOMALY_THRESHOLD
 
-    if anomaly_score > 0.60:
+    if anomaly_score > ANOMALY_CRITICAL:
         ml_severity = 2
     elif anomaly_score > ANOMALY_THRESHOLD:
         ml_severity = 1
